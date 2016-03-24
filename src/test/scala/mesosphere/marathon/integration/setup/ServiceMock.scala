@@ -1,0 +1,199 @@
+package mesosphere.marathon.integration.setup
+
+import java.util.Date
+import javax.servlet.http.{ HttpServletRequest, HttpServletResponse }
+
+import mesosphere.marathon.integration.setup.ServiceMock.Plan
+import org.eclipse.jetty.server.handler.AbstractHandler
+import org.eclipse.jetty.server.{ Request, Server }
+import play.api.libs.json.{ Json, Writes }
+import scala.util.parsing.combinator.RegexParsers
+
+/**
+  * ServiceMock that speaks the service upgrade protocol v1 + admin handlers.
+  *
+  * GET  /v1/plan -> returns the plan
+  * PUT  /v1/plan -> continues the plan with the command flag (decision point)
+  *
+  * POST /admin/rollback -> rollback the plan
+  * PUT  /admin/next -> proceed with next step (no decision point)
+  * POST /admin/error -> add an error to the plan
+  *
+  * @param plan the plan to execute on
+  */
+class ServiceMock(plan: Plan) extends AbstractHandler {
+
+  def start(port: Int) {
+    val server = new Server(port)
+    server.setHandler(this)
+    server.start()
+    server.join()
+  }
+
+  override def handle(target: String,
+                      baseRequest: Request,
+                      request: HttpServletRequest,
+                      response: HttpServletResponse): Unit = {
+    def status[T](t: T, code: Int)(implicit writes: Writes[T]): Unit = {
+      response.getWriter.write(Json.prettyPrint(Json.toJson(t)))
+      response.setHeader("Content-Type", "application/json")
+      response.setStatus(code)
+    }
+    def ok[T](t: T)(implicit writes: Writes[T]): Unit = status(t, 200)
+    def error[T](t: T)(implicit writes: Writes[T]): Unit = status(t, 503)
+
+    (request.getMethod, request.getPathInfo) match {
+      case ("GET", "/v1/plan") =>
+        if (plan.isDone) ok(plan) else error(plan)
+      case ("PUT", "/v1/plan") =>
+        val cmd = Option(request.getParameter("cmd")).getOrElse("undefined")
+        cmd match {
+          case "continue" => plan.next(withContinue = true)
+          case "finalize" => plan.doFinalize()
+        }
+        ok(Json.obj("Result" -> s"Received cmd: $cmd"))
+      case ("POST", "/admin/rollback") =>
+        plan.rollback()
+        ok(Json.obj("Result" -> "Rollback"))
+      case ("PUT", "/admin/next") =>
+        plan.next(withContinue = false)
+        ok(Json.obj("Result" -> plan.status))
+      case ("POST", "/admin/error") =>
+        plan.errors ::= s"Got an error at ${new Date}"
+        ok(plan.errors)
+    }
+    baseRequest.setHandled(true)
+  }
+}
+
+object ServiceMock {
+
+  case class Plan(phases: List[Phase]) {
+    var errors: List[String] = List.empty
+    def isDone = phases.forall(_.isDone)
+    def status = currentPhase.fold("Complete")(_.status)
+    def currentPhase: Option[Phase] = phases.find(_.currentBlock.isDefined)
+    def next(withContinue: Boolean): Boolean = {
+      currentPhase.fold(true) { phase =>
+        val done = phase.next(withContinue)
+        if (done) currentPhase.map(_.next(withContinue)).getOrElse(true) else done
+      }
+    }
+    def doFinalize(): Unit = {
+      phases.foreach(_.blocks.foreach(_.doFinalize()))
+    }
+    def rollback(): Unit = {
+      phases.foreach(_.rollback)
+      errors = List.empty
+    }
+  }
+
+  case class Phase(name: String, blocks: List[Block]) {
+    def isDone = blocks.forall(_.isDone)
+    def status = currentBlock.fold("Complete")(_.status)
+    def currentBlock: Option[Block] = blocks.find(b => b.isInProgress || b.notStarted)
+    def next(withContinue: Boolean): Boolean = {
+      currentBlock.fold(true) { block =>
+        val done = block.next(withContinue)
+        if (done) block.next(withContinue) else done
+      }
+    }
+    def rollback(): Unit = blocks.foreach(_.rollback)
+  }
+
+  case class Block(name: String, decisionPoint: Boolean) {
+    private var inProgress: Boolean = false
+    private var done: Boolean = false
+
+    def isDone = done
+    def isInProgress = inProgress
+    def notStarted = !inProgress && !done
+
+    def status: String = {
+      if (done) "Complete"
+      else if (inProgress && decisionPoint) "Waiting"
+      else if (inProgress && !decisionPoint) "InProgress"
+      else "Pending"
+    }
+
+    def next(withContinue: Boolean): Boolean = {
+      if (notStarted) inProgress = true
+      else if (inProgress && ((decisionPoint && withContinue) || (!decisionPoint && !withContinue))) {
+        inProgress = false
+        done = true
+      }
+      done
+    }
+
+    def rollback(): Unit = {
+      inProgress = false
+      done = false
+    }
+
+    def doFinalize(): Unit = {
+      inProgress = false
+      done = true
+    }
+  }
+
+  implicit val blockWrites: Writes[Block] = Writes { block =>
+    Json.obj(
+      "has_decision_point" -> block.decisionPoint,
+      "id" -> block.name,
+      "message" -> block.name,
+      "name" -> block.name,
+      "status" -> block.status
+    )
+  }
+
+  implicit val phaseWrites: Writes[Phase] = Writes { phase =>
+    Json.obj(
+      "blocks" -> phase.blocks,
+      "id" -> phase.name,
+      "name" -> phase.name,
+      "status" -> phase.status
+    )
+  }
+
+  implicit val planWrites: Writes[Plan] = Writes { plan =>
+    Json.obj(
+      "errors" -> plan.errors,
+      "phases" -> plan.phases,
+      "status" -> plan.status
+    )
+  }
+
+  /**
+    * Parse a plan from a string.
+    * If a block needs a decision add an ! at the end
+    * Format: phase(block,block,block),phase(decision!,decision!)
+    */
+  class PlanParser extends RegexParsers {
+    def ident: Parser[String] = """([-A-Za-z0-9_.])+""".r
+    def block: Parser[Block] = ident ~ opt("!") ^^ {
+      case name ~ decissionPoint => Block(name, decissionPoint.isDefined)
+    }
+    def blocks: Parser[List[Block]] = "(" ~> repsep(block, ",") <~ ")"
+    def phase: Parser[Phase] = ident ~ blocks ^^ {
+      case name ~ blocks => Phase(name, blocks)
+    }
+    def plan: Parser[Plan] = repsep(phase, ",") ^^ Plan
+
+    def parsePlan(in: String): Plan = {
+      parseAll(plan, in) match {
+        case Success(plan, _)      => plan
+        case NoSuccess(message, r) => throw new RuntimeException(message + r.pos)
+      }
+    }
+  }
+
+  /**
+    * Start a ServiceMock that listens on $PORT0 with plan defined by argv[0]
+    * Usage: test:runMain mesosphere.marathon.integration.setup.ServiceMock phase(block1!,block2!,block3!)
+    */
+  def main(args: Array[String]) {
+    val port = sys.env("PORT0").toInt
+    val plan = new PlanParser().parsePlan(args(0))
+    new ServiceMock(plan).start(port)
+  }
+}
