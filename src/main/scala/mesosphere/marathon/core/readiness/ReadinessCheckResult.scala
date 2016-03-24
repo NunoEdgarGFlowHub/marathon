@@ -7,5 +7,4 @@ case class ReadinessCheckResult(name: String,
                                 ready: Boolean,
                                 httpResponse: Option[HttpResponse])
 
-case class HttpResponse(status: Int, mediaType: String, body: Array[Byte])
-
+case class HttpResponse(status: Int, contentType: String, body: String)

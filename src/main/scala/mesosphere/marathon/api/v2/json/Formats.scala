@@ -10,6 +10,7 @@ import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.event._
 import mesosphere.marathon.event.http.EventSubscribers
 import mesosphere.marathon.health.{ Health, HealthCheck }
+import mesosphere.marathon.core.readiness.{ HttpResponse, ReadinessCheckResult }
 import mesosphere.marathon.state.Container.Docker
 import mesosphere.marathon.state.Container.Docker.PortMapping
 import mesosphere.marathon.state._
@@ -56,7 +57,8 @@ trait Formats
     with EventFormats
     with EventSubscribersFormats
     with PluginFormats
-    with IpAddressFormats {
+    with IpAddressFormats
+    with ReadinessCheckFormats {
 
   implicit lazy val TaskFailureWrites: Writes[TaskFailure] = Writes { failure =>
     Json.obj(
@@ -338,6 +340,20 @@ trait DeploymentFormats {
   }
 
   implicit lazy val DeploymentStepWrites: Writes[DeploymentStep] = Json.writes[DeploymentStep]
+}
+
+trait ReadinessCheckFormats {
+  import Formats._
+  import mesosphere.marathon.core.readiness._
+
+  implicit lazy val ReadinessCheckResultWrites: Format[ReadinessCheckResult] = (
+    (__ \ "name").format[String] ~
+    (__ \ "taskId").format[Task.Id] ~
+    (__ \ "ready").format[Boolean] ~
+    (__ \ "lastResponse").formatNullable[HttpResponse]
+  ) (ReadinessCheckResult.apply(_, _, _, _), unlift(ReadinessCheckResult.unapply))
+
+  implicit lazy val ReadinessCheckHttpResponseFormat: Format[HttpResponse] = Json.format[HttpResponse]
 }
 
 trait EventFormats {
